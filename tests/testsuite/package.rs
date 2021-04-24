@@ -621,10 +621,10 @@ fn include_untracked_without_include_dirty_raises_error() {
     p.change_file("test.txt", r#"secret data pls don't read"#);
     p.cargo("build").run();
     p.cargo("package --list --include-untracked")
-        .with_stderr(
+        .with_status(101)
+        .with_stderr_contains(
             "\
-error: 2 files in the working directory contain changes that were not yet \
-committed into git:
+error: 2 files in the working directory contain changes that were not yet committed into git:
 
 dirty files:
 \tsrc/main.rs
@@ -632,7 +632,8 @@ dirty files:
 untracked files:
 \ttest.txt
 
-to proceed despite this and include the dirty files in your package, pass the `--include-dirty` flag",
+to proceed despite this and include the dirty files in your package, pass the `--include-dirty` flag
+",
         )
         .run();
 }
