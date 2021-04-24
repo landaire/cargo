@@ -14,7 +14,15 @@ pub fn cli() -> App {
         ))
         .arg(opt(
             "allow-dirty",
-            "Allow dirty working directories to be packaged",
+            "Allow dirty working directories to be packaged (deprecated, use include-dirty instead)",
+        ))
+        .arg(opt(
+            "include-dirty",
+            "Allow dirty files in working directories to be packaged",
+        ))
+        .arg(opt(
+            "include-untracked",
+            "Allow dirty files in working directories to be packaged",
         ))
         .arg_target_triple("Build for the target triple")
         .arg_target_dir()
@@ -40,7 +48,8 @@ pub fn exec(config: &mut Config, args: &ArgMatches<'_>) -> CliResult {
             token: args.value_of("token").map(|s| s.to_string()),
             index,
             verify: !args.is_present("no-verify"),
-            allow_dirty: args.is_present("allow-dirty"),
+            include_dirty: args.is_present("allow-dirty") || args.is_present("include-dirty"),
+            include_untracked: args.is_present("include-untracked"),
             targets: args.targets(),
             jobs: args.jobs()?,
             dry_run: args.is_present("dry-run"),

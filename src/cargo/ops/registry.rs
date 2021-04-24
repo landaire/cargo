@@ -48,7 +48,10 @@ pub struct PublishOpts<'cfg> {
     pub token: Option<String>,
     pub index: Option<String>,
     pub verify: bool,
-    pub allow_dirty: bool,
+    /// Include dirty files in the published package
+    pub include_dirty: bool,
+    /// Include untracked files in the published package
+    pub include_untracked: bool,
     pub jobs: Option<u32>,
     pub targets: Vec<String>,
     pub dry_run: bool,
@@ -108,7 +111,8 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
             verify: opts.verify,
             list: false,
             check_metadata: true,
-            allow_dirty: opts.allow_dirty,
+            include_dirty: opts.include_dirty,
+            include_untracked: opts.include_untracked,
             targets: opts.targets.clone(),
             jobs: opts.jobs,
             cli_features: opts.cli_features.clone(),

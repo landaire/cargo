@@ -26,7 +26,8 @@ pub struct PackageOpts<'cfg> {
     pub config: &'cfg Config,
     pub list: bool,
     pub check_metadata: bool,
-    pub allow_dirty: bool,
+    pub include_dirty: bool,
+    pub include_untracked: bool,
     pub verify: bool,
     pub jobs: Option<u32>,
     pub targets: Vec<String>,
@@ -61,6 +62,24 @@ enum GeneratedFile {
     VcsInfo(String),
 }
 
+#[derive(PartialEq, Eq, Debug)]
+enum FileState {
+    Untracked,
+    Dirty,
+    SubmoduleDirtyAndUntracked,
+    Clean,
+}
+
+#[derive(Debug)]
+struct RepoState {
+    /// The ID indicating the current revision of the repo. This may be a hash
+    /// or other unique identifier for the VCS.
+    id: String,
+    /// List of all dirty files found in the repository. Files within a submodule
+    /// are represented simply by the submodule path.
+    dirty_files: Vec<(FileState, PathBuf)>,
+}
+
 pub fn package(ws: &Workspace<'_>, opts: &PackageOpts<'_>) -> CargoResult<Option<FileLock>> {
     if ws.root().join("Cargo.lock").exists() {
         // Make sure the Cargo.lock is up-to-date and valid.
@@ -84,17 +103,30 @@ pub fn package(ws: &Workspace<'_>, opts: &PackageOpts<'_>) -> CargoResult<Option
              the exclude list will be ignored",
         )?;
     }
-    let src_files = src.list_files(pkg)?;
+    let mut src_files = src.list_files(pkg)?;
 
     // Check (git) repository state, getting the current commit hash if not
-    // dirty.
-    let vcs_info = if !opts.allow_dirty {
-        // This will error if a dirty repo is found.
-        check_repo_state(pkg, &src_files, config)?
-            .map(|h| format!("{{\n  \"git\": {{\n    \"sha1\": \"{}\"\n  }}\n}}\n", h))
-    } else {
-        None
-    };
+    // dirty. check_repo_state will reror if a dirty repo is found.
+    let vcs_info =
+        if let Some(repo_state) = check_repo_state(pkg, &src_files, config, opts.include_dirty)? {
+            // If the user does not want to include untracked files, we must filter these
+            // out of the package list
+            if !opts.include_untracked {
+                src_files.retain(|src_file| {
+                    !repo_state
+                        .dirty_files
+                        .iter()
+                        .filter(|(state, _path)| *state == FileState::Untracked)
+                        .any(|(_, untracked_path)| src_file == untracked_path)
+                });
+            }
+            Some(format!(
+                "{{\n  \"git\": {{\n    \"sha1\": \"{}\"\n  }}\n}}\n",
+                repo_state.id
+            ))
+        } else {
+            None
+        };
 
     let ar_files = build_ar_list(ws, pkg, src_files, vcs_info)?;
 
@@ -356,7 +388,8 @@ fn check_repo_state(
     p: &Package,
     src_files: &[PathBuf],
     config: &Config,
-) -> CargoResult<Option<String>> {
+    include_dirty: bool,
+) -> CargoResult<Option<RepoState>> {
     if let Ok(repo) = git2::Repository::discover(p.root()) {
         if let Some(workdir) = repo.workdir() {
             debug!("found a git repo at {:?}", workdir);
@@ -368,7 +401,7 @@ fn check_repo_state(
                         "found (git) Cargo.toml at {:?} in workdir {:?}",
                         path, workdir
                     );
-                    return git(p, src_files, &repo);
+                    return git(p, src_files, &repo, include_dirty);
                 }
             }
             config.shell().verbose(|shell| {
@@ -389,66 +422,188 @@ fn check_repo_state(
     // directory is dirty or not, thus we have to assume that it's clean.
     return Ok(None);
 
+    /// Checks if a git status code indicates the file is in a dirty state. If
+    /// `include_untracked` is true, untracked files will be considered as part
+    /// of this check.
+    fn git_status_dirty_type(status: git2::Status) -> FileState {
+        // CURRENT files are never dirty
+        if status == git2::Status::CURRENT {
+            return FileState::Clean;
+        }
+
+        // We must explicitly check if this file's status indicates
+        // the file is tracked by git (https://github.com/rust-lang/cargo/issues/93988)
+        if status.intersects(
+            git2::Status::WT_NEW | git2::Status::WT_TYPECHANGE | git2::Status::WT_RENAMED,
+        ) {
+            FileState::Untracked
+        } else {
+            FileState::Dirty
+        }
+    }
+
     fn git(
         p: &Package,
         src_files: &[PathBuf],
         repo: &git2::Repository,
-    ) -> CargoResult<Option<String>> {
+        ignore_dirty: bool,
+    ) -> CargoResult<Option<RepoState>> {
         let workdir = repo.workdir().unwrap();
 
         let mut sub_repos = Vec::new();
         open_submodules(repo, &mut sub_repos)?;
         // Sort so that longest paths are first, to check nested submodules first.
         sub_repos.sort_unstable_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
-        let submodule_dirty = |path: &Path| -> bool {
+        let submodule_dirty = |path: &Path| -> FileState {
             sub_repos
                 .iter()
                 .filter(|(sub_path, _sub_repo)| path.starts_with(sub_path))
-                .any(|(sub_path, sub_repo)| {
+                .map(|(sub_path, sub_repo)| {
                     let relative = path.strip_prefix(sub_path).unwrap();
                     sub_repo
                         .status_file(relative)
-                        .map(|status| status != git2::Status::CURRENT)
-                        .unwrap_or(false)
+                        .map(|status| git_status_dirty_type(status))
+                        .unwrap_or(FileState::Clean)
+                })
+                .fold(FileState::Clean, |accum, single_state| {
+                    // If we're currently in a clean state, the state transition doesn't matter.
+                    if accum == FileState::Clean {
+                        return single_state;
+                    }
+
+                    // If this file is clean but the accumulated state is dirty, we ignore
+                    // this single file's state
+                    if single_state == FileState::Clean {
+                        return accum;
+                    }
+
+                    if accum != single_state {
+                        // If the accumulator is not clean and this file doesn't match,
+                        // we're in a state with mixed dirty and untracked files
+                        FileState::SubmoduleDirtyAndUntracked
+                    } else {
+                        // The current file state matches the accumlated state
+                        accum
+                    }
                 })
         };
 
         let dirty = src_files
             .iter()
-            .filter(|file| {
+            .filter_map(|file| {
                 let relative = file.strip_prefix(workdir).unwrap();
-                if let Ok(status) = repo.status_file(relative) {
+                let file_state = if let Ok(status) = repo.status_file(relative) {
+                    // CURRENT indicates that the file is tracked by git and clean
                     if status == git2::Status::CURRENT {
-                        false
+                        FileState::Clean
                     } else if relative.file_name().and_then(|s| s.to_str()).unwrap_or("")
                         == "Cargo.lock"
                     {
                         // It is OK to include this file even if it is ignored.
-                        status != git2::Status::IGNORED
+                        if status != git2::Status::IGNORED {
+                            FileState::Clean
+                        } else {
+                            FileState::Dirty
+                        }
                     } else {
-                        true
+                        git_status_dirty_type(status)
                     }
                 } else {
                     submodule_dirty(file)
+                };
+
+                if matches!(file_state, FileState::Clean) {
+                    None
+                } else {
+                    Some((file_state, file.clone()))
                 }
             })
-            .map(|path| {
-                path.strip_prefix(p.root())
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
             .collect::<Vec<_>>();
-        if dirty.is_empty() {
+
+        // We may proceed with dirty files if, and only if, all of the files
+        // are untracked OR the use wishes to ignore dirty files. Untracked files
+        // should be filtered by the caller for their purposes, not us (see: https://github.com/rust-lang/cargo/issues/9398).
+        if dirty.is_empty()
+            || dirty.iter().all(|(state, _)| {
+                if ignore_dirty {
+                    matches!(state, FileState::Dirty | FileState::Untracked)
+                } else {
+                    *state == FileState::Untracked
+                }
+            })
+        {
             let rev_obj = repo.revparse_single("HEAD")?;
-            Ok(Some(rev_obj.id().to_string()))
+            Ok(Some(RepoState {
+                id: rev_obj.id().to_string(),
+                dirty_files: dirty,
+            }))
         } else {
+            // Map to the relative path here to make things easier when filtering
+            // out the different file states
+            let dirty: Vec<_> = dirty
+                .iter()
+                .map(|(state, file)| {
+                    let path = file
+                        .strip_prefix(p.root())
+                        .unwrap_or(file)
+                        .display()
+                        .to_string();
+                    (state, path)
+                })
+                .collect();
+
+            let untracked_files: Vec<_> = dirty
+                .iter()
+                .filter(|(state, _path)| matches!(state, FileState::Untracked))
+                .map(|(_, path)| path.as_ref())
+                .collect();
+
+            let dirty_files: Vec<_> = dirty
+                .iter()
+                .filter(|(state, _path)| matches!(state, FileState::Dirty))
+                .map(|(_, path)| path.as_ref())
+                .collect();
+
+            let untracked_and_dirty: Vec<_> = dirty
+                .iter()
+                .filter(|(state, _path)| matches!(state, FileState::SubmoduleDirtyAndUntracked))
+                .map(|(_, path)| path.as_ref())
+                .collect();
+
+            // The error message presented to the user should reflect what state the repo is in.
+            // Are there just dirty files? Are there just untracked files? Are there both?
+            let untracked_files_text = if untracked_files.is_empty() {
+                std::borrow::Cow::from("")
+            } else {
+                std::borrow::Cow::from(format!(
+                    "untracked files:\n\t{}\n\n",
+                    untracked_files.join("\n\t")
+                ))
+            };
+
+            let dirty_files_text = if dirty_files.is_empty() {
+                std::borrow::Cow::from("")
+            } else {
+                std::borrow::Cow::from(format!("dirty files:\n\t{}\n\n", dirty_files.join("\n\t")))
+            };
+
+            let untracked_and_dirty_text = if untracked_and_dirty.is_empty() {
+                std::borrow::Cow::from("")
+            } else {
+                std::borrow::Cow::from(format!(
+                    "submodules with untracked and dirty files:\n\t{}\n\n",
+                    untracked_and_dirty.join("\n\t")
+                ))
+            };
+
             anyhow::bail!(
                 "{} files in the working directory contain changes that were \
-                 not yet committed into git:\n\n{}\n\n\
-                 to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag",
+                 not yet committed into git:\n\n{}{}{}\
+                 to proceed despite this and include the dirty files in your package, pass the `--include-dirty` flag",
                 dirty.len(),
-                dirty.join("\n")
+                dirty_files_text,
+                untracked_files_text,
+                untracked_and_dirty_text,
             )
         }
     }

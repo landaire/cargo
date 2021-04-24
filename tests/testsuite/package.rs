@@ -563,7 +563,7 @@ fn no_duplicates_from_modified_tracked_files() {
     let p = git::new("all", |p| p.file("src/main.rs", "fn main() {}"));
     p.change_file("src/main.rs", r#"fn main() { println!("A change!"); }"#);
     p.cargo("build").run();
-    p.cargo("package --list --allow-dirty")
+    p.cargo("package --list --include-dirty")
         .with_stdout(
             "\
 Cargo.lock
@@ -571,6 +571,68 @@ Cargo.toml
 Cargo.toml.orig
 src/main.rs
 ",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn no_untracked_files() {
+    let p = git::new("all", |p| p.file("src/main.rs", "fn main() {}"));
+    p.change_file("src/main.rs", r#"fn main() { println!("A change!"); }"#);
+    p.change_file("test.txt", r#"secret data pls don't read"#);
+    p.cargo("build").run();
+    p.cargo("package --list --include-dirty")
+        .with_stdout(
+            "\
+.cargo_vcs_info.json
+Cargo.lock
+Cargo.toml
+Cargo.toml.orig
+src/main.rs
+",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn include_untracked_files() {
+    let p = git::new("all", |p| p.file("src/main.rs", "fn main() {}"));
+    p.change_file("src/main.rs", r#"fn main() { println!("A change!"); }"#);
+    p.change_file("test.txt", r#"secret data pls don't read"#);
+    p.cargo("build").run();
+    p.cargo("package --list --include-dirty --include-untracked")
+        .with_stdout(
+            "\
+.cargo_vcs_info.json
+Cargo.lock
+Cargo.toml
+Cargo.toml.orig
+src/main.rs
+test.txt
+",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn include_untracked_without_include_dirty_raises_error() {
+    let p = git::new("all", |p| p.file("src/main.rs", "fn main() {}"));
+    p.change_file("src/main.rs", r#"fn main() { println!("A change!"); }"#);
+    p.change_file("test.txt", r#"secret data pls don't read"#);
+    p.cargo("build").run();
+    p.cargo("package --list --include-untracked")
+        .with_stderr(
+            "\
+error: 2 files in the working directory contain changes that were not yet \
+committed into git:
+
+dirty files:
+\tsrc/main.rs
+
+untracked files:
+\ttest.txt
+
+to proceed despite this and include the dirty files in your package, pass the `--include-dirty` flag",
         )
         .run();
 }
